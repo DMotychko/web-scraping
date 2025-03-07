@@ -1,76 +1,53 @@
-import puppeteer from "puppeteer";
+import puppeteer, { Page } from "puppeteer";
 import * as fs from "fs-extra";
 import * as path from "path";
+import axios from "axios";
+
+interface Catalog {
+    title: string;
+    link: string;
+    date: string;
+    pdf: string;
+}
+
+const downloadPDF = async (url: string, filename: string, folder: string): Promise<void> => {
+    const filePath = path.join(folder, filename);
+    const { data } = await axios({ url, responseType: "stream" });
+    data.pipe(fs.createWriteStream(filePath));
+    await new Promise((resolve) => data.on("end", resolve));
+};
+
+const fetchCatalogs = async (page: Page): Promise<Catalog[]> => {
+    return page.evaluate(() =>
+        [...document.querySelectorAll("ul.custom-slick-slider.js-slick-slider.slick-initialized.slick-slider:not(.custom-slick-slider-recipe) .list-item")].map(catalog => {
+            const linkElement = catalog.querySelector("h3 a") as HTMLAnchorElement | null;
+            const pdfElement = catalog.querySelector("a[href$='.pdf']") as HTMLAnchorElement | null;
+            const timeElements = [...catalog.querySelectorAll("p time")].map(t => t.textContent?.trim()).join(" - ") || "Немає дати";
+
+            return {
+                title: linkElement?.textContent?.trim() || "Без назви",
+                link: linkElement?.href || "",
+                date: timeElements,
+                pdf: pdfElement?.href || ""
+            };
+        })
+    );
+};
 
 (async () => {
     const browser = await puppeteer.launch({ headless: false });
     const page = await browser.newPage();
-
-    // Відкриваємо сторінку каталогів
     await page.goto("https://www.tus.si/#s2", { waitUntil: "networkidle2" });
-
-    // Очікуємо завантаження блоків каталогів
     await page.waitForSelector(".list-item");
 
-    // Отримуємо всі каталоги
-    const catalogs = await page.evaluate(() => {
-        return [...document.querySelectorAll(".list-item")].map(catalog => {
-            const linkElement = catalog.querySelector("h3 a");
-            return {
-                title: linkElement?.textContent?.trim() || "Без назви",
-                link: linkElement instanceof HTMLAnchorElement ? linkElement.href : "Немає посилання",
-                date: "", // Поки що пусте поле для дати
-                pdf: "" // Поки що пусте поле для PDF
-            };
-        });
-    });
-
-    // Створюємо директорію для PDF
-    const downloadPath = path.join(process.cwd(), "downloads");
+    const catalogs: Catalog[] = await fetchCatalogs(page);
+    const downloadPath: string = path.join(process.cwd(), "downloads");
     await fs.ensureDir(downloadPath);
 
-    // Проходимо по кожному каталогу та шукаємо PDF і дату
-    for (const catalog of catalogs) {
-        if (!catalog.link || catalog.link === "Немає посилання") continue;
+    await Promise.all(catalogs.map(catalog =>
+        catalog.pdf ? downloadPDF(catalog.pdf, catalog.title.replace(/\W+/g, "_") + ".pdf", downloadPath) : Promise.resolve()
+    ));
 
-        await page.goto(catalog.link, { waitUntil: "networkidle2" });
-
-        // Очікуємо на елемент, який містить дату
-        await page.waitForSelector("time");
-
-        // Витягуємо дату дії каталогу
-        catalog.date = await page.evaluate(() => {
-            const times = document.querySelectorAll("time");
-            if (times.length === 2) {
-                return `${times[0]?.textContent?.trim()} - ${times[1]?.textContent?.trim()}`;
-            }
-            return "Немає дати";
-        });
-
-        // Шукаємо посилання на PDF в <figcaption> з класом "pdf"
-        const pdfLink = await page.evaluate(() => {
-            const pdfLinkElement = document.querySelector("figcaption a.pdf") as HTMLAnchorElement;
-            return pdfLinkElement ? pdfLinkElement.href : "";
-
-        });
-
-        if (pdfLink) {
-            catalog.pdf = pdfLink;
-            const pdfPath = path.join(downloadPath, `${catalog.title.replace(/[/\\:*?"<>|]/g, "_")}.pdf`);
-            const pdf = await page.goto(pdfLink);
-            if (pdf) {
-                await fs.writeFile(pdfPath, await pdf.buffer());
-                console.log(`Завантажено: ${pdfPath}`);
-            }
-        } else {
-            console.log(`PDF для каталогу ${catalog.title} не знайдено.`);
-        }
-    }
-
-    // Зберігаємо інформацію в JSON
-    const jsonPath = path.join(process.cwd(), "catalogs.json");
-    await fs.writeJson(jsonPath, catalogs, { spaces: 2 });
-    console.log("Збережено в JSON:", jsonPath);
-
+    await fs.writeJson(path.join(process.cwd(), "catalogs.json"), catalogs, { spaces: 2 });
     await browser.close();
 })();
